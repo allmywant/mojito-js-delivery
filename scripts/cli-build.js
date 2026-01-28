@@ -11,7 +11,8 @@ const sendLifecycleEventsFn = require('./cli-send-lifecycle-events');
 let args,
     builtWaves = {},
     changedConfigFiles = {},
-    comparingCommits;
+    comparingCommits,
+    mcpConfig;
 /**
  * build a test object
  * @param {String} configFile, config file path
@@ -28,6 +29,7 @@ function buildTest(configFile, buildResult) {
     sendLifecycleEvents(testObject, configFile);
 
     testObject = tokenizePaths(testObject);
+    mergeProps(testObject);
 
     // skip inactive tests
     if (testObject.state == 'inactive') {
@@ -55,6 +57,17 @@ function buildTest(configFile, buildResult) {
         buildResult[testObject.id].state = 'divert';
     }
 
+    var recipes = testObject.recipes || {},
+        recipe;
+    for (var key in recipes) {
+        recipe = recipes[key];
+        // if the test is diverted, remove the js and css properties from the non-diverted recipes, so the js and css content won't be included in the container
+        if (testObject.state == 'live' && testObject.divertTo && key != testObject.divertTo) {
+            delete recipe.js;
+            delete recipe.css;
+        }
+    }
+
     contents = JSON.stringify(testObject, null, 4);
     // inject file contents
     // shared js and css
@@ -72,8 +85,6 @@ function buildTest(configFile, buildResult) {
     }
 
     // recipes
-    var recipes = testObject.recipes || {},
-        recipe;
     for (var key in recipes) {
         recipe = recipes[key];
 
@@ -330,9 +341,121 @@ function parseChangedFileList(rootPath) {
 }
 
 /**
+ * merge props from JSON config 
+ * @param {Object} testObject 
+ */
+function mergeProps(testObject) {
+    if (!mcpConfig || !mcpConfig.features || !mcpConfig.features[testObject.id]) {
+        return;
+    }
+
+    let feature = mcpConfig.features[testObject.id];
+
+    if (feature.id) {
+        testObject.id = feature.id;
+    }
+
+    if (feature.name) {
+        testObject.name = feature.name;
+    }
+    
+    if (['staging', 'live', 'inactive'].includes(feature.state)) {
+        testObject.state = feature.state;
+    }
+
+    if (!isNaN(parseFloat(feature.sampleRate))) {
+        testObject.sampleRate = parseFloat(feature.sampleRate);
+    }
+
+    let divertedRecipeHasSampleRate = false;
+    if (Object.keys(feature.variants).length === 1 && testObject.state === 'live') {
+        testObject.divertTo = Object.keys(feature.variants)[0];
+
+        if (feature.variants[testObject.divertTo].sampleRate != null || (testObject.recipes[testObject.divertTo] && testObject.recipes[testObject.divertTo].sampleRate != null)) {
+            divertedRecipeHasSampleRate = true;
+        }
+    }
+
+    // payloads
+    let experimentPayload = Object.assign(feature.payload||{}, testObject.payload||{});
+
+    let recipes = testObject.recipes || {},
+        recipesInFeature = feature.variants || {},
+        recipe,
+        recipeInFeature,
+        matchedRecipes = 0;
+    for (let key in recipes) {
+        if (divertedRecipeHasSampleRate && key != testObject.divertTo) {
+            recipes[key].sampleRate = 0;
+        }
+
+        if (!recipesInFeature[key]) {
+            continue;
+        }
+
+        matchedRecipes++;
+        recipeInFeature = recipesInFeature[key];
+        recipe = recipes[key];
+        // for now, only merge the simpleRate, name and payload properties
+        if (!isNaN(parseFloat(recipeInFeature.sampleRate))) {
+            recipe.sampleRate = parseFloat(recipeInFeature.sampleRate);
+        }
+
+        if (recipeInFeature.name) {
+            recipe.name = recipeInFeature.name;
+        }
+        
+        let recipePayload = Object.assign(Object.assign({}, experimentPayload), recipeInFeature.payload||{}, recipe.payload||{});
+        if (Object.keys(recipePayload).length) {
+            recipe.payload = recipePayload;
+        }
+    }
+
+    if (matchedRecipes > 0) {
+        // add the missing recipes from MCP
+        if (Object.keys(recipesInFeature).length > Object.keys(recipes).length) {
+            for (let key in recipesInFeature) {
+                if (recipes[key]) {
+                    continue;
+                }
+
+                recipes[key] = recipesInFeature[key];
+            }
+        }
+    } else if (Object.keys(recipesInFeature).length) {
+        // no matched recipes, replace the Recipes in the affected test with those from MCP
+        testObject.recipes = recipesInFeature;
+        console.warn(`${testObject.name} (${testObject.id}): At least one recipe must be matched between MCP recipes and JS recipes, replaced JS recipes with MCP recipes.`);
+    }
+}
+
+async function getExperimentsConfig() {
+    if (!config.mojitoControlPlane || !config.mojitoControlPlane.baseUrl || !config.mojitoControlPlane.propertyId) {
+        return;
+    }
+
+    let baseUrl = config.mojitoControlPlane.baseUrl.trim(),
+        jsonUrl;
+    if (baseUrl.endsWith('/')) {
+        jsonUrl = config.mojitoControlPlane.baseUrl + `${config.mojitoControlPlane.propertyId}.json`;
+    } else {
+        jsonUrl = config.mojitoControlPlane.baseUrl + `/${config.mojitoControlPlane.propertyId}.json`;
+    }
+
+    try {
+        let response = await fetch(jsonUrl);
+        mcpConfig = await response.json();
+    } catch (error) {
+        throw new Error('Mojito Building - get JSON config failed: ' + (error.message||error));
+    }
+}
+
+/**
  * Mojito building - building test objects based on config.yml
  */
 module.exports = async function build (cliArgs) {
+    await getExperimentsConfig();
+
     args = cliArgs||{};
     let containerName = config.containerName;
     let rootPath = process.cwd(),
